@@ -113,8 +113,10 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         // 3. ON -> keep on the same line as JOIN, then indent the ON condition (+4)
         if kind == Token::On {
             next_line_indent = Some(stmt_indent + 4);
-        } else if let Some(cols) = next_line_indent.take() {
-            push_newline(&mut out, cols);
+        } else if raw != "(" {
+            if let Some(cols) = next_line_indent.take() {
+                push_newline(&mut out, cols);
+            }
         }
 
         // 4. After SELECT (or DISTINCT), FROM, or WHERE -> indent the next token (+2)

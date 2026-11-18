@@ -117,8 +117,12 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             push_newline(&mut out, cols);
         }
 
-        // 4. After FROM -> indent the first table (+2); keep JOIN table inline
-        if kind == Token::From {
+        // 4. After SELECT (or DISTINCT), FROM, or WHERE -> indent the next token (+2)
+        if kind == Token::Select {
+            if next_kind != Token::Distinct {
+                next_line_indent = Some(stmt_indent + 2);
+            }
+        } else if matches!(kind, Token::Distinct | Token::From | Token::Where) {
             next_line_indent = Some(stmt_indent + 2);
         }
 

@@ -23,6 +23,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
     let mut stmt_indent = base_indent;
     let mut paren_stack: Vec<ParenKind> = Vec::new();
     let mut in_create_function_header = false;
+    let mut next_line_indent: Option<usize> = None;
 
     let push_newline = |out: &mut String, cols: usize| {
         while out.ends_with(' ') {
@@ -38,6 +39,11 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         let tok = &tokens[i];
         let raw = &input[tok.start as usize..tok.end as usize];
         let kind = Token::try_from(tok.token).unwrap_or(Token::Nul);
+        let prev_kind = if i > 0 {
+            Token::try_from(tokens[i - 1].token).unwrap_or(Token::Nul)
+        } else {
+            Token::Nul
+        };
 
         // Track CREATE FUNCTION header so we know its '(' is a parameter list
         if kind == Token::Create {
@@ -67,7 +73,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             }
         }
 
-        // Major SQL clauses -> newline aligned with statement
+        // 1. Major SQL clauses -> newline aligned with statement
         if matches!(
             kind,
             Token::From
@@ -79,6 +85,41 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 | Token::Into
         ) {
             push_newline(&mut out, stmt_indent);
+            next_line_indent = None;
+        }
+
+        // 2. JOIN (and LEFT/INNER/RIGHT/FULL/CROSS modifiers) -> aligned with previous table (+2)
+        let next_kind = if i + 1 < tokens.len() {
+            Token::try_from(tokens[i + 1].token).unwrap_or(Token::Nul)
+        } else {
+            Token::Nul
+        };
+
+        let is_join_modifier = matches!(
+            kind,
+            Token::Left | Token::Right | Token::InnerP | Token::Full | Token::Cross
+        ) && matches!(next_kind, Token::Join | Token::OuterP);
+
+        let after_join_modifier = matches!(
+            prev_kind,
+            Token::Left | Token::Right | Token::InnerP | Token::Full | Token::Cross | Token::OuterP
+        );
+
+        if is_join_modifier || (kind == Token::Join && !after_join_modifier) {
+            push_newline(&mut out, stmt_indent + 2);
+            next_line_indent = None;
+        }
+
+        // 3. ON -> keep on the same line as JOIN, then indent the ON condition (+4)
+        if kind == Token::On {
+            next_line_indent = Some(stmt_indent + 4);
+        } else if let Some(cols) = next_line_indent.take() {
+            push_newline(&mut out, cols);
+        }
+
+        // 4. After FROM -> indent the first table (+2); keep JOIN table inline
+        if kind == Token::From {
+            next_line_indent = Some(stmt_indent + 2);
         }
 
         match raw {
@@ -109,8 +150,6 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                     ParenKind::InlineCall
                 };
 
-                // Add a space before '(' for boolean groups (e.g., `where (`),
-                // while keeping `cleanup(` and `unnest(` attached to their names
                 if pkind == ParenKind::BooleanGroup {
                     if let Some(last) = out.chars().last() {
                         if !last.is_whitespace() && last != '(' {
@@ -137,7 +176,6 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 if pkind == ParenKind::InlineCall {
                     out.push_str(", ");
                 } else {
-                    // Leading comma aligned with start of statement
                     push_newline(&mut out, stmt_indent);
                     out.push_str(", ");
                 }
@@ -152,7 +190,11 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                     push_newline(&mut out, indent);
                 }
                 Token::Sconst => {
-                    // Preserve string literals verbatim
+                    if let Some(last) = out.chars().last() {
+                        if !last.is_whitespace() && last != '(' {
+                            out.push(' ');
+                        }
+                    }
                     out.push_str(raw);
                 }
                 Token::And | Token::Or => {

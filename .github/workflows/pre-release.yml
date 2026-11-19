@@ -1,0 +1,91 @@
+name: pre-release
+on:
+  push:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: create-release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.release.outputs.upload_url }}
+      version: latest
+    steps:
+      - name: Create GitHub release
+        id: release
+        uses: marvinpinto/action-automatic-releases@latest
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          automatic_release_tag: latest
+          draft: false
+          prerelease: true
+          title: "Development Release"
+
+  build-pre-release:
+    name: build-pre-release
+    runs-on: ${{ matrix.os }}
+    needs: ['create-release']
+    strategy:
+      matrix:
+        build: [linux, macos, win-msvc, win32-msvc]
+        include:
+        - build: linux
+          os: ubuntu-latest
+          rust: nightly
+          target: x86_64-unknown-linux-musl
+          friendly_name: linux64
+        - build: macos
+          os: macos-latest
+          rust: nightly
+          target: x86_64-apple-darwin
+          friendly_name: macos64
+        - build: win-msvc
+          os: windows-2019
+          rust: nightly
+          target: x86_64-pc-windows-msvc
+          friendly_name: windows64
+        - build: win32-msvc
+          os: windows-2019
+          rust: nightly
+          target: i686-pc-windows-msvc
+          friendly_name: windows32
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          target: ${{ matrix.target }}
+      - name: Run Tests
+        run: cargo test
+      - name: Build release binary
+        run: cargo build --release
+      - name: Build archive
+        shell: bash
+        run: |
+          staging="sqlfmt-${{ needs.create-release.outputs.version }}-${{ matrix.friendly_name }}"
+          mkdir -p "$staging"
+          cp {README.md,LICENSE.txt} "$staging/"
+          if [[ "${{ matrix.build }}" == win* ]]; then
+            cp "target/release/sqlfmt.exe" "$staging/"
+            (cd "$staging" && 7z a "../$staging.zip" *)
+            echo "ASSET=$staging.zip" >> $GITHUB_ENV
+          else
+            cp "target/release/sqlfmt" "$staging/"
+            COPYFILE_DISABLE=1 tar czf "$staging.tar.gz" -C "$staging" .
+            echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
+          fi
+      - name: Upload release archive
+        uses: actions/upload-release-asset@v1.0.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ${{ env.ASSET }}
+          asset_name: ${{ env.ASSET }}
+          asset_content_type: application/octet-stream

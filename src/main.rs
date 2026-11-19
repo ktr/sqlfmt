@@ -34,6 +34,8 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
     let mut in_returns_type = false;
     let mut in_between = false;
     let mut next_line_indent: Option<usize> = None;
+    let mut in_cte_list = false;
+    let mut cte_indent = base_indent;
 
     let push_newline = |out: &mut String, cols: usize| {
         while out.ends_with(' ') {
@@ -65,7 +67,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             Token::Nul
         };
 
-        // Track CREATE FUNCTION header & RETURNS <type> boundary
+        // Track CREATE FUNCTION header, RETURNS <type> boundary, and CTE blocks
         if kind == Token::Create {
             stmt_indent = indent;
             in_create_function_header = true;
@@ -79,6 +81,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 kind,
                 Token::Language
                     | Token::As
+                    | Token::Set
                     | Token::Immutable
                     | Token::Stable
                     | Token::Volatile
@@ -91,8 +94,23 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         {
             in_returns_type = false;
             push_newline(&mut out, indent);
+        } else if kind == Token::As && paren_stack.is_empty() && stmt_indent == indent {
+            in_create_function_header = false;
+            in_returns_type = false;
+            push_newline(&mut out, indent);
         } else if kind == Token::As {
             in_create_function_header = false;
+        } else if kind == Token::With && paren_stack.is_empty() {
+            in_cte_list = true;
+            cte_indent = stmt_indent;
+        } else if in_cte_list
+            && paren_stack.is_empty()
+            && matches!(
+                kind,
+                Token::Select | Token::Insert | Token::Update | Token::DeleteP
+            )
+        {
+            in_cte_list = false;
         }
 
         // Recursively format $$ ... $$ PL/pgSQL bodies using PostgreSQL's own lexer
@@ -102,6 +120,11 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 if raw.ends_with(tag) && raw.len() >= tag.len() * 2 {
                     let inner = &raw[tag.len()..raw.len() - tag.len()];
                     if let Ok(formatted_inner) = format_sql(inner, indent + 2) {
+                        if let Some(last) = out.chars().last() {
+                            if !last.is_whitespace() && last != '(' {
+                                out.push(' ');
+                            }
+                        }
                         out.push_str(tag);
                         push_newline(&mut out, indent + 2);
                         out.push_str(formatted_inner.trim_start());
@@ -147,7 +170,6 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 | Token::GroupP
                 | Token::Limit
                 | Token::Returning
-                | Token::Into
                 | Token::Union
         ) {
             push_newline(&mut out, stmt_indent);
@@ -177,6 +199,13 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             if let Some(cols) = next_line_indent.take() {
                 push_newline(&mut out, cols);
             }
+        }
+
+        // Capture the exact indentation where `WITH` was placed
+        if kind == Token::With && paren_stack.is_empty() {
+            in_cte_list = true;
+            let current_line = out.rsplit('\n').next().unwrap_or("");
+            cte_indent = current_line.chars().take_while(|c| *c == ' ').count();
         }
 
         // 4. Post-keyword triggers to indent the following token
@@ -301,15 +330,20 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 out.push_str(raw);
             }
             "," => {
-                let pkind = paren_stack
-                    .last()
-                    .map(|f| f.kind)
-                    .unwrap_or(ParenKind::CreateFuncParams);
-                if pkind == ParenKind::InlineCall {
+                if paren_stack.is_empty() && in_cte_list {
+                    push_newline(&mut out, cte_indent);
                     out.push_str(", ");
                 } else {
-                    push_newline(&mut out, stmt_indent);
-                    out.push_str(", ");
+                    let pkind = paren_stack
+                        .last()
+                        .map(|f| f.kind)
+                        .unwrap_or(ParenKind::CreateFuncParams);
+                    if pkind == ParenKind::InlineCall {
+                        out.push_str(", ");
+                    } else {
+                        push_newline(&mut out, stmt_indent);
+                        out.push_str(", ");
+                    }
                 }
             }
             ";" => {

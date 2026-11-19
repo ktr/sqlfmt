@@ -130,12 +130,14 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             }
         }
 
-        // 4. After SELECT (or DISTINCT), FROM, or WHERE -> indent the next token (+2)
+        // 4. After SELECT (or DISTINCT), FROM, WHERE, or ORDER/GROUP BY -> indent the next token (+2)
         if kind == Token::Select {
             if next_kind != Token::Distinct {
                 next_line_indent = Some(stmt_indent + 2);
             }
         } else if matches!(kind, Token::Distinct | Token::From | Token::Where) {
+            next_line_indent = Some(stmt_indent + 2);
+        } else if kind == Token::By && matches!(prev_kind, Token::Order | Token::GroupP) {
             next_line_indent = Some(stmt_indent + 2);
         }
 

@@ -49,18 +49,18 @@ jobs:
       - name: Build archive
         shell: bash
         run: |
-          staging="pgsqlfmt-latest-${{ matrix.friendly_name }}"
+          staging="sqlfmt-latest-${{ matrix.friendly_name }}"
           mkdir -p "$staging"
           [ -f README.md ] && cp README.md "$staging/"
           [ -f LICENSE.txt ] && cp LICENSE.txt "$staging/"
           [ -f LICENSE ] && cp LICENSE "$staging/"
 
           if [[ "${{ matrix.os }}" == windows* ]]; then
-            cp "target/${{ matrix.target }}/release/pgsqlfmt.exe" "$staging/"
+            cp "target/${{ matrix.target }}/release/sqlfmt.exe" "$staging/"
             (cd "$staging" && 7z a "../$staging.zip" *)
             echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
           else
-            cp "target/${{ matrix.target }}/release/pgsqlfmt" "$staging/"
+            cp "target/${{ matrix.target }}/release/sqlfmt" "$staging/"
             COPYFILE_DISABLE=1 tar czf "$staging.tar.gz" -C "$staging" .
             echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
           fi

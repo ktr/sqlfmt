@@ -175,7 +175,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                     ParenKind::InlineCall
                 };
 
-                if pkind == ParenKind::BooleanGroup {
+                if matches!(pkind, ParenKind::BooleanGroup | ParenKind::Subquery) && !had_pending_indent {
                     if let Some(last) = out.chars().last() {
                         if !last.is_whitespace() && last != '(' {
                             out.push(' ');
@@ -186,12 +186,14 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                     push_newline(&mut out, stmt_indent + 2);
                 }
 
-                // Measure the indentation of the current line where '(' is being placed
-                let open_line_indent = out
-                    .rsplit('\n')
-                    .next()
-                    .map(|line| line.chars().take_while(|c| *c == ' ').count())
-                    .unwrap_or(stmt_indent);
+                let current_line = out.rsplit('\n').next().unwrap_or("");
+                let leading_spaces = current_line.chars().take_while(|c| *c == ' ').count();
+                // Account for a leading ", " prefix so the block aligns under the item (e.g. `lateral`), not the comma
+                let open_line_indent = if current_line[leading_spaces..].starts_with(", ") {
+                    leading_spaces + 2
+                } else {
+                    leading_spaces
+                };
 
                 out.push('(');
 
@@ -252,7 +254,13 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                     out.push_str(raw);
                 }
                 Token::And | Token::Or => {
-                    push_newline(&mut out, stmt_indent + 2);
+                    let bool_indent = match paren_stack.last() {
+                        Some(frame) if frame.kind == ParenKind::BooleanGroup => {
+                            frame.close_indent + 2
+                        }
+                        _ => stmt_indent + 2,
+                    };
+                    push_newline(&mut out, bool_indent);
                     out.push_str(&raw.to_lowercase());
                 }
                 _ => {

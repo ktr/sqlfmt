@@ -14,8 +14,8 @@ enum ParenKind {
 #[derive(Clone, Copy)]
 struct ParenFrame {
     kind: ParenKind,
-    close_indent: usize,      // indent of the line where '(' appeared
-    prev_stmt_indent: usize,  // outer statement indent to restore on ')'
+    close_indent: usize,
+    prev_stmt_indent: usize,
 }
 
 fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error> {
@@ -31,8 +31,9 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
     let mut stmt_indent = base_indent;
     let mut paren_stack: Vec<ParenFrame> = Vec::new();
     let mut in_create_function_header = false;
-    let mut next_line_indent: Option<usize> = None;
+    let mut in_returns_type = false;
     let mut in_between = false;
+    let mut next_line_indent: Option<usize> = None;
 
     let push_newline = |out: &mut String, cols: usize| {
         while out.ends_with(' ') {
@@ -53,12 +54,44 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         } else {
             Token::Nul
         };
+        let prev_raw = if i > 0 {
+            &input[tokens[i - 1].start as usize..tokens[i - 1].end as usize]
+        } else {
+            ""
+        };
+        let next_kind = if i + 1 < tokens.len() {
+            Token::try_from(tokens[i + 1].token).unwrap_or(Token::Nul)
+        } else {
+            Token::Nul
+        };
 
-        // Only reset stmt_indent for top-level statements; subqueries set stmt_indent when '(' opens
+        // Track CREATE FUNCTION header & RETURNS <type> boundary
         if kind == Token::Create {
             stmt_indent = indent;
             in_create_function_header = true;
-        } else if kind == Token::Returns || kind == Token::As {
+            in_returns_type = false;
+        } else if kind == Token::Returns {
+            in_create_function_header = false;
+            in_returns_type = true;
+        } else if in_returns_type
+            && paren_stack.is_empty()
+            && matches!(
+                kind,
+                Token::Language
+                    | Token::As
+                    | Token::Immutable
+                    | Token::Stable
+                    | Token::Volatile
+                    | Token::StrictP
+                    | Token::Security
+                    | Token::Parallel
+                    | Token::Cost
+                    | Token::Rows
+            )
+        {
+            in_returns_type = false;
+            push_newline(&mut out, indent);
+        } else if kind == Token::As {
             in_create_function_header = false;
         }
 
@@ -86,8 +119,25 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             stmt_indent = indent + 2;
             next_line_indent = None;
         } else if kind == Token::EndP {
-            stmt_indent = indent;
+            if next_kind == Token::IfP {
+                // Closing `END IF;` inside PL/pgSQL dedents one level
+                stmt_indent = stmt_indent.saturating_sub(2).max(indent + 2);
+            } else {
+                // Closing `END;` of a BEGIN..END block
+                stmt_indent = indent;
+            }
             push_newline(&mut out, stmt_indent);
+            next_line_indent = None;
+        } else if kind == Token::Ident
+            && raw.eq_ignore_ascii_case("elsif")
+            && stmt_indent > indent + 2
+        {
+            stmt_indent -= 2;
+            push_newline(&mut out, stmt_indent);
+            next_line_indent = None;
+        } else if kind == Token::Else && stmt_indent > indent + 2 {
+            // ELSE inside an IF block aligns with the matching IF
+            push_newline(&mut out, stmt_indent - 2);
             next_line_indent = None;
         } else if matches!(
             kind,
@@ -98,18 +148,13 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 | Token::Limit
                 | Token::Returning
                 | Token::Into
+                | Token::Union
         ) {
             push_newline(&mut out, stmt_indent);
             next_line_indent = None;
         }
 
         // 2. JOIN (and LEFT/INNER/RIGHT/FULL/CROSS modifiers) -> aligned with previous table (+2)
-        let next_kind = if i + 1 < tokens.len() {
-            Token::try_from(tokens[i + 1].token).unwrap_or(Token::Nul)
-        } else {
-            Token::Nul
-        };
-
         let is_join_modifier = matches!(
             kind,
             Token::Left | Token::Right | Token::InnerP | Token::Full | Token::Cross
@@ -134,7 +179,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             }
         }
 
-        // 4. After SELECT (or DISTINCT), FROM, WHERE, ORDER/GROUP BY, DECLARE, or BEGIN -> indent the next token
+        // 4. Post-keyword triggers to indent the following token
         if kind == Token::Select {
             if next_kind != Token::Distinct {
                 next_line_indent = Some(stmt_indent + 2);
@@ -145,16 +190,24 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             next_line_indent = Some(stmt_indent + 2);
         } else if matches!(kind, Token::Declare | Token::BeginP) {
             next_line_indent = Some(stmt_indent);
+        } else if kind == Token::Then {
+            stmt_indent += 2;
+            next_line_indent = Some(stmt_indent);
+        } else if kind == Token::Else && stmt_indent > indent + 2 {
+            next_line_indent = Some(stmt_indent);
+        } else if kind == Token::Union {
+            if next_kind != Token::All {
+                next_line_indent = Some(stmt_indent);
+            }
+        } else if kind == Token::All && prev_kind == Token::Union {
+            next_line_indent = Some(stmt_indent);
         }
 
         match raw {
             "(" => {
                 let had_pending_indent = next_line_indent.take().is_some();
-
-                // Detect subquery immediately starting with SELECT or WITH
                 let is_subquery = matches!(next_kind, Token::Select | Token::With);
 
-                // Look ahead to matching ')' to see if this group contains AND / OR
                 let mut depth = 1;
                 let mut has_bool_op = false;
                 if !is_subquery {
@@ -184,20 +237,20 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                     ParenKind::InlineCall
                 };
 
-                if matches!(pkind, ParenKind::BooleanGroup | ParenKind::Subquery) && !had_pending_indent {
+                if matches!(pkind, ParenKind::BooleanGroup | ParenKind::Subquery)
+                    && !had_pending_indent
+                {
                     if let Some(last) = out.chars().last() {
                         if !last.is_whitespace() && last != '(' {
                             out.push(' ');
                         }
                     }
                 } else if had_pending_indent {
-                    // e.g. `from (\n  select ...` or `where coalesce(a, b) = 1`
                     push_newline(&mut out, stmt_indent + 2);
                 }
 
                 let current_line = out.rsplit('\n').next().unwrap_or("");
                 let leading_spaces = current_line.chars().take_while(|c| *c == ' ').count();
-                // Account for a leading ", " prefix so the block aligns under the item (e.g. `lateral`), not the comma
                 let open_line_indent = if current_line[leading_spaces..].starts_with(", ") {
                     leading_spaces + 2
                 } else {
@@ -232,6 +285,20 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 }
                 out.push(')');
                 stmt_indent = frame.prev_stmt_indent;
+
+                // After closing a CTE `)`, put the following SELECT / INSERT / UPDATE / DELETE on a new line
+                if frame.kind == ParenKind::Subquery
+                    && matches!(
+                        next_kind,
+                        Token::Select | Token::With | Token::Insert | Token::Update | Token::DeleteP
+                    )
+                {
+                    next_line_indent = Some(stmt_indent);
+                }
+            }
+            "[" | "]" => {
+                // Keep array brackets tight: `bigint[]`, `array[]`, `arr[1]`
+                out.push_str(raw);
             }
             "," => {
                 let pkind = paren_stack
@@ -257,7 +324,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 }
                 Token::Sconst => {
                     if let Some(last) = out.chars().last() {
-                        if !last.is_whitespace() && last != '(' {
+                        if !last.is_whitespace() && last != '(' && last != '[' {
                             out.push(' ');
                         }
                     }
@@ -291,14 +358,16 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 }
                 _ => {
                     let lower = raw.to_lowercase();
+                    let no_space_before =
+                        lower == "." || lower == "%" || kind == Token::Typecast;
+                    let after_tight_token = prev_raw == "("
+                        || prev_raw == "["
+                        || prev_raw == "."
+                        || prev_raw == "%"
+                        || prev_kind == Token::Typecast;
+
                     if let Some(last) = out.chars().last() {
-                        if !last.is_whitespace()
-                            && last != '('
-                            && last != '.'
-                            && last != '%'
-                            && lower != "."
-                            && lower != "%"
-                        {
+                        if !last.is_whitespace() && !no_space_before && !after_tight_token {
                             out.push(' ');
                         }
                     }
@@ -325,7 +394,6 @@ fn main() {
         }
     };
 
-    // Validate syntax with PostgreSQL's real parser before formatting
     if let Err(e) = pg_query::parse(&input) {
         eprintln!("PostgreSQL syntax error: {e}");
         std::process::exit(1);

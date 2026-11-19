@@ -280,7 +280,10 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
 
                 let current_line = out.rsplit('\n').next().unwrap_or("");
                 let leading_spaces = current_line.chars().take_while(|c| *c == ' ').count();
-                let open_line_indent = if current_line[leading_spaces..].starts_with(", ") {
+                // Account for a leading ", " prefix in FROM/SELECT lists, but NOT for top-level CTE definitions
+                let open_line_indent = if current_line[leading_spaces..].starts_with(", ")
+                    && !(in_cte_list && paren_stack.is_empty())
+                {
                     leading_spaces + 2
                 } else {
                     leading_spaces

@@ -357,7 +357,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             _ => match kind {
                 Token::SqlComment | Token::CComment => {
                     out.push_str(raw);
-                    push_newline(&mut out, indent);
+                    push_newline(&mut out, stmt_indent);
                 }
                 Token::Sconst => {
                     if let Some(last) = out.chars().last() {

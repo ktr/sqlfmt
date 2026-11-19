@@ -1,91 +1,75 @@
 name: pre-release
+
 on:
   push:
-    branches: [ main ]
+    branches: [main]
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  create-release:
-    name: create-release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.release.outputs.upload_url }}
-      version: latest
-    steps:
-      - name: Create GitHub release
-        id: release
-        uses: marvinpinto/action-automatic-releases@latest
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          automatic_release_tag: latest
-          draft: false
-          prerelease: true
-          title: "Development Release"
-
   build-pre-release:
-    name: build-pre-release
+    name: build (${{ matrix.friendly_name }})
     runs-on: ${{ matrix.os }}
-    needs: ['create-release']
     strategy:
+      fail-fast: false
       matrix:
-        build: [linux, macos, win-msvc, win32-msvc]
         include:
-        - build: linux
-          os: ubuntu-latest
-          rust: nightly
-          target: x86_64-unknown-linux-musl
-          friendly_name: linux64
-        - build: macos
-          os: macos-latest
-          rust: nightly
-          target: x86_64-apple-darwin
-          friendly_name: macos64
-        - build: win-msvc
-          os: windows-2019
-          rust: nightly
-          target: x86_64-pc-windows-msvc
-          friendly_name: windows64
-        - build: win32-msvc
-          os: windows-2019
-          rust: nightly
-          target: i686-pc-windows-msvc
-          friendly_name: windows32
+          - friendly_name: linux64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - friendly_name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - friendly_name: macos-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+          - friendly_name: windows64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
+
       - name: Run Tests
-        run: cargo test
+        run: cargo test --target ${{ matrix.target }}
+
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
+
       - name: Build archive
         shell: bash
         run: |
-          staging="sqlfmt-${{ needs.create-release.outputs.version }}-${{ matrix.friendly_name }}"
+          staging="pgsqlfmt-latest-${{ matrix.friendly_name }}"
           mkdir -p "$staging"
-          cp {README.md,LICENSE.txt} "$staging/"
-          if [[ "${{ matrix.build }}" == win* ]]; then
-            cp "target/release/sqlfmt.exe" "$staging/"
+          [ -f README.md ] && cp README.md "$staging/"
+          [ -f LICENSE.txt ] && cp LICENSE.txt "$staging/"
+          [ -f LICENSE ] && cp LICENSE "$staging/"
+
+          if [[ "${{ matrix.os }}" == windows* ]]; then
+            cp "target/${{ matrix.target }}/release/pgsqlfmt.exe" "$staging/"
             (cd "$staging" && 7z a "../$staging.zip" *)
-            echo "ASSET=$staging.zip" >> $GITHUB_ENV
+            echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
           else
-            cp "target/release/sqlfmt" "$staging/"
+            cp "target/${{ matrix.target }}/release/pgsqlfmt" "$staging/"
             COPYFILE_DISABLE=1 tar czf "$staging.tar.gz" -C "$staging" .
-            echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
+            echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
           fi
-      - name: Upload release archive
-        uses: actions/upload-release-asset@v1.0.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload to pre-release
+        uses: softprops/action-gh-release@v2
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ env.ASSET }}
-          asset_name: ${{ env.ASSET }}
-          asset_content_type: application/octet-stream
+          tag_name: latest
+          name: Development Release
+          prerelease: true
+          make_latest: "false"
+          files: ${{ env.ASSET }}

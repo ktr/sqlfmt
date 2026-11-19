@@ -58,10 +58,6 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         if kind == Token::Create {
             stmt_indent = indent;
             in_create_function_header = true;
-        } else if matches!(kind, Token::Select | Token::Update | Token::DeleteP | Token::Insert | Token::With) {
-            if paren_stack.last().map(|f| f.kind) != Some(ParenKind::Subquery) {
-                stmt_indent = indent;
-            }
         } else if kind == Token::Returns || kind == Token::As {
             in_create_function_header = false;
         }
@@ -84,8 +80,16 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             }
         }
 
-        // 1. Major SQL clauses -> newline aligned with statement
-        if matches!(
+        // 1. Major SQL clauses & PL/pgSQL block boundaries
+        if matches!(kind, Token::Declare | Token::BeginP) {
+            push_newline(&mut out, indent);
+            stmt_indent = indent + 2;
+            next_line_indent = None;
+        } else if kind == Token::EndP {
+            stmt_indent = indent;
+            push_newline(&mut out, stmt_indent);
+            next_line_indent = None;
+        } else if matches!(
             kind,
             Token::From
                 | Token::Where
@@ -130,7 +134,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             }
         }
 
-        // 4. After SELECT (or DISTINCT), FROM, WHERE, or ORDER/GROUP BY -> indent the next token (+2)
+        // 4. After SELECT (or DISTINCT), FROM, WHERE, ORDER/GROUP BY, DECLARE, or BEGIN -> indent the next token
         if kind == Token::Select {
             if next_kind != Token::Distinct {
                 next_line_indent = Some(stmt_indent + 2);
@@ -139,6 +143,8 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             next_line_indent = Some(stmt_indent + 2);
         } else if kind == Token::By && matches!(prev_kind, Token::Order | Token::GroupP) {
             next_line_indent = Some(stmt_indent + 2);
+        } else if matches!(kind, Token::Declare | Token::BeginP) {
+            next_line_indent = Some(stmt_indent);
         }
 
         match raw {
@@ -240,8 +246,9 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 }
             }
             ";" => {
+                in_between = false;
                 out.push(';');
-                push_newline(&mut out, indent);
+                push_newline(&mut out, stmt_indent);
             }
             _ => match kind {
                 Token::SqlComment | Token::CComment => {
@@ -268,6 +275,9 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 Token::And if in_between => {
                     in_between = false;
                     out.push_str(" and");
+                }
+                Token::Or if prev_kind == Token::Create && next_kind == Token::Replace => {
+                    out.push_str(" or");
                 }
                 Token::And | Token::Or => {
                     let bool_indent = match paren_stack.last() {

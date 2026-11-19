@@ -7,7 +7,15 @@ use std::io::{self, Read};
 enum ParenKind {
     CreateFuncParams,
     BooleanGroup,
+    Subquery,
     InlineCall,
+}
+
+#[derive(Clone, Copy)]
+struct ParenFrame {
+    kind: ParenKind,
+    close_indent: usize,      // indent of the line where '(' appeared
+    prev_stmt_indent: usize,  // outer statement indent to restore on ')'
 }
 
 fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error> {
@@ -21,7 +29,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
 
     let indent = base_indent;
     let mut stmt_indent = base_indent;
-    let mut paren_stack: Vec<ParenKind> = Vec::new();
+    let mut paren_stack: Vec<ParenFrame> = Vec::new();
     let mut in_create_function_header = false;
     let mut next_line_indent: Option<usize> = None;
 
@@ -45,12 +53,14 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             Token::Nul
         };
 
-        // Track CREATE FUNCTION header so we know its '(' is a parameter list
+        // Only reset stmt_indent for top-level statements; subqueries set stmt_indent when '(' opens
         if kind == Token::Create {
             stmt_indent = indent;
             in_create_function_header = true;
-        } else if matches!(kind, Token::Select | Token::Update | Token::DeleteP | Token::Insert) {
-            stmt_indent = indent;
+        } else if matches!(kind, Token::Select | Token::Update | Token::DeleteP | Token::Insert | Token::With) {
+            if paren_stack.last().map(|f| f.kind) != Some(ParenKind::Subquery) {
+                stmt_indent = indent;
+            }
         } else if kind == Token::Returns || kind == Token::As {
             in_create_function_header = false;
         }
@@ -130,26 +140,35 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
 
         match raw {
             "(" => {
+                let had_pending_indent = next_line_indent.take().is_some();
+
+                // Detect subquery immediately starting with SELECT or WITH
+                let is_subquery = matches!(next_kind, Token::Select | Token::With);
+
                 // Look ahead to matching ')' to see if this group contains AND / OR
                 let mut depth = 1;
                 let mut has_bool_op = false;
-                for ahead in &tokens[i + 1..] {
-                    let ahead_raw = &input[ahead.start as usize..ahead.end as usize];
-                    let ahead_kind = Token::try_from(ahead.token).unwrap_or(Token::Nul);
-                    if ahead_raw == "(" {
-                        depth += 1;
-                    } else if ahead_raw == ")" {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
+                if !is_subquery {
+                    for ahead in &tokens[i + 1..] {
+                        let ahead_raw = &input[ahead.start as usize..ahead.end as usize];
+                        let ahead_kind = Token::try_from(ahead.token).unwrap_or(Token::Nul);
+                        if ahead_raw == "(" {
+                            depth += 1;
+                        } else if ahead_raw == ")" {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        } else if depth == 1 && matches!(ahead_kind, Token::And | Token::Or) {
+                            has_bool_op = true;
                         }
-                    } else if depth == 1 && matches!(ahead_kind, Token::And | Token::Or) {
-                        has_bool_op = true;
                     }
                 }
 
                 let pkind = if in_create_function_header && paren_stack.is_empty() {
                     ParenKind::CreateFuncParams
+                } else if is_subquery {
+                    ParenKind::Subquery
                 } else if has_bool_op {
                     ParenKind::BooleanGroup
                 } else {
@@ -162,23 +181,52 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                             out.push(' ');
                         }
                     }
-                }
-
-                out.push('(');
-                if pkind != ParenKind::InlineCall {
+                } else if had_pending_indent {
+                    // e.g. `from (\n  select ...` or `where coalesce(a, b) = 1`
                     push_newline(&mut out, stmt_indent + 2);
                 }
-                paren_stack.push(pkind);
+
+                // Measure the indentation of the current line where '(' is being placed
+                let open_line_indent = out
+                    .rsplit('\n')
+                    .next()
+                    .map(|line| line.chars().take_while(|c| *c == ' ').count())
+                    .unwrap_or(stmt_indent);
+
+                out.push('(');
+
+                let prev_stmt_indent = stmt_indent;
+                if pkind == ParenKind::Subquery {
+                    stmt_indent = open_line_indent + 2;
+                    push_newline(&mut out, stmt_indent);
+                } else if pkind != ParenKind::InlineCall {
+                    push_newline(&mut out, open_line_indent + 2);
+                }
+
+                paren_stack.push(ParenFrame {
+                    kind: pkind,
+                    close_indent: open_line_indent,
+                    prev_stmt_indent,
+                });
             }
             ")" => {
-                let pkind = paren_stack.pop().unwrap_or(ParenKind::InlineCall);
-                if pkind != ParenKind::InlineCall {
-                    push_newline(&mut out, stmt_indent);
+                let frame = paren_stack.pop().unwrap_or(ParenFrame {
+                    kind: ParenKind::InlineCall,
+                    close_indent: stmt_indent,
+                    prev_stmt_indent: stmt_indent,
+                });
+
+                if frame.kind != ParenKind::InlineCall {
+                    push_newline(&mut out, frame.close_indent);
                 }
                 out.push(')');
+                stmt_indent = frame.prev_stmt_indent;
             }
             "," => {
-                let pkind = paren_stack.last().copied().unwrap_or(ParenKind::CreateFuncParams);
+                let pkind = paren_stack
+                    .last()
+                    .map(|f| f.kind)
+                    .unwrap_or(ParenKind::CreateFuncParams);
                 if pkind == ParenKind::InlineCall {
                     out.push_str(", ");
                 } else {

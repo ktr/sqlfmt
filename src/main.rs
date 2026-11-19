@@ -32,6 +32,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
     let mut paren_stack: Vec<ParenFrame> = Vec::new();
     let mut in_create_function_header = false;
     let mut next_line_indent: Option<usize> = None;
+    let mut in_between = false;
 
     let push_newline = |out: &mut String, cols: usize| {
         while out.ends_with(' ') {
@@ -252,6 +253,19 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                         }
                     }
                     out.push_str(raw);
+                }
+                Token::Between => {
+                    in_between = true;
+                    if let Some(last) = out.chars().last() {
+                        if !last.is_whitespace() && last != '(' {
+                            out.push(' ');
+                        }
+                    }
+                    out.push_str("between");
+                }
+                Token::And if in_between => {
+                    in_between = false;
+                    out.push_str(" and");
                 }
                 Token::And | Token::Or => {
                     let bool_indent = match paren_stack.last() {

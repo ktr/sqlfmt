@@ -36,6 +36,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
     let mut next_line_indent: Option<usize> = None;
     let mut in_cte_list = false;
     let mut cte_indent = base_indent;
+    let mut in_declare_section = false;
 
     let push_newline = |out: &mut String, cols: usize| {
         while out.ends_with(' ') {
@@ -137,9 +138,15 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         }
 
         // 1. Major SQL clauses & PL/pgSQL block boundaries
-        if matches!(kind, Token::Declare | Token::BeginP) {
+        if kind == Token::Declare {
             push_newline(&mut out, indent);
             stmt_indent = indent + 2;
+            in_declare_section = true;
+            next_line_indent = None;
+        } else if kind == Token::BeginP {
+            push_newline(&mut out, indent);
+            stmt_indent = indent + 2;
+            in_declare_section = false;
             next_line_indent = None;
         } else if kind == Token::EndP {
             if next_kind == Token::IfP {
@@ -351,8 +358,21 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             }
             ";" => {
                 in_between = false;
+                in_cte_list = false;
                 out.push(';');
-                push_newline(&mut out, stmt_indent);
+
+                let next_closes_block = matches!(next_kind, Token::EndP | Token::Else)
+                    || (next_kind == Token::Ident
+                        && i + 1 < tokens.len()
+                        && input[tokens[i + 1].start as usize..tokens[i + 1].end as usize]
+                            .eq_ignore_ascii_case("elsif"));
+
+                if stmt_indent <= indent + 2 && !next_closes_block && !in_declare_section {
+                    out.push_str("\n\n");
+                    out.push_str(&" ".repeat(stmt_indent));
+                } else {
+                    push_newline(&mut out, stmt_indent);
+                }
             }
             _ => match kind {
                 Token::SqlComment | Token::CComment => {

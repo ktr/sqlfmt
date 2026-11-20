@@ -37,6 +37,8 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
     let mut in_cte_list = false;
     let mut cte_indent = base_indent;
     let mut in_declare_section = false;
+    let mut in_create_function = false;
+    let mut case_stack: Vec<usize> = Vec::new();
 
     let push_newline = |out: &mut String, cols: usize| {
         while out.ends_with(' ') {
@@ -71,6 +73,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         // Track CREATE FUNCTION header, RETURNS <type> boundary, and CTE blocks
         if kind == Token::Create {
             stmt_indent = indent;
+            in_create_function = true;
             in_create_function_header = true;
             in_returns_type = false;
         } else if kind == Token::Returns {
@@ -94,24 +97,17 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             )
         {
             in_returns_type = false;
+            if kind == Token::As {
+                in_create_function = false;
+            }
             push_newline(&mut out, indent);
-        } else if kind == Token::As && paren_stack.is_empty() && stmt_indent == indent {
+        } else if kind == Token::As && in_create_function && paren_stack.is_empty() {
+            in_create_function = false;
             in_create_function_header = false;
             in_returns_type = false;
             push_newline(&mut out, indent);
         } else if kind == Token::As {
             in_create_function_header = false;
-        } else if kind == Token::With && paren_stack.is_empty() {
-            in_cte_list = true;
-            cte_indent = stmt_indent;
-        } else if in_cte_list
-            && paren_stack.is_empty()
-            && matches!(
-                kind,
-                Token::Select | Token::Insert | Token::Update | Token::DeleteP
-            )
-        {
-            in_cte_list = false;
         }
 
         // Recursively format $$ ... $$ PL/pgSQL bodies using PostgreSQL's own lexer
@@ -150,13 +146,18 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             next_line_indent = None;
         } else if kind == Token::EndP {
             if next_kind == Token::IfP {
-                // Closing `END IF;` inside PL/pgSQL dedents one level
                 stmt_indent = stmt_indent.saturating_sub(2).max(indent + 2);
+                push_newline(&mut out, stmt_indent);
+            } else if let Some(case_col) = case_stack.pop() {
+                push_newline(&mut out, case_col);
             } else {
-                // Closing `END;` of a BEGIN..END block
                 stmt_indent = indent;
+                push_newline(&mut out, stmt_indent);
             }
-            push_newline(&mut out, stmt_indent);
+            next_line_indent = None;
+        } else if kind == Token::When && !case_stack.is_empty() {
+            let case_col = *case_stack.last().unwrap();
+            push_newline(&mut out, case_col + 2);
             next_line_indent = None;
         } else if kind == Token::Ident
             && raw.eq_ignore_ascii_case("elsif")
@@ -165,10 +166,14 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             stmt_indent -= 2;
             push_newline(&mut out, stmt_indent);
             next_line_indent = None;
-        } else if kind == Token::Else && stmt_indent > indent + 2 {
-            // ELSE inside an IF block aligns with the matching IF
-            push_newline(&mut out, stmt_indent - 2);
-            next_line_indent = None;
+        } else if kind == Token::Else {
+            if let Some(&case_col) = case_stack.last() {
+                push_newline(&mut out, case_col + 2);
+                next_line_indent = None;
+            } else if stmt_indent > indent + 2 {
+                push_newline(&mut out, stmt_indent - 2);
+                next_line_indent = None;
+            }
         } else if matches!(
             kind,
             Token::From
@@ -208,6 +213,17 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             }
         }
 
+        if kind == Token::Case {
+            let current_line = out.rsplit('\n').next().unwrap_or("");
+            let mut case_col = current_line.len();
+            if let Some(last) = current_line.chars().last() {
+                if !last.is_whitespace() && last != '(' && last != '[' {
+                    case_col += 1; // account for the space inserted before `case`
+                }
+            }
+            case_stack.push(case_col);
+        }
+
         // Capture the exact indentation where `WITH` was placed
         if kind == Token::With && paren_stack.is_empty() {
             in_cte_list = true;
@@ -220,16 +236,24 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             if next_kind != Token::Distinct {
                 next_line_indent = Some(stmt_indent + 2);
             }
-        } else if matches!(kind, Token::Distinct | Token::From | Token::Where) {
+        } else if kind == Token::Distinct {
+            let in_inline_call = paren_stack
+                .last()
+                .map(|f| f.kind == ParenKind::InlineCall)
+                .unwrap_or(false);
+            if !in_inline_call {
+                next_line_indent = Some(stmt_indent + 2);
+            }
+        } else if matches!(kind, Token::From | Token::Where) {
             next_line_indent = Some(stmt_indent + 2);
         } else if kind == Token::By && matches!(prev_kind, Token::Order | Token::GroupP) {
             next_line_indent = Some(stmt_indent + 2);
         } else if matches!(kind, Token::Declare | Token::BeginP) {
             next_line_indent = Some(stmt_indent);
-        } else if kind == Token::Then {
+        } else if kind == Token::Then && case_stack.is_empty() {
             stmt_indent += 2;
             next_line_indent = Some(stmt_indent);
-        } else if kind == Token::Else && stmt_indent > indent + 2 {
+        } else if kind == Token::Else && case_stack.is_empty() && stmt_indent > indent + 2 {
             next_line_indent = Some(stmt_indent);
         } else if kind == Token::Union {
             if next_kind != Token::All {

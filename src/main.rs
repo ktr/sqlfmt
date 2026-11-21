@@ -19,6 +19,34 @@ struct ParenFrame {
     prev_stmt_indent: usize,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum BlockKind {
+    /// `begin ... [exception ...] end`
+    Begin,
+    /// `if ... then ... [elsif ...] [else ...] end if`
+    If,
+    /// `[for|foreach|while ...] loop ... end loop`
+    Loop,
+    /// PL/pgSQL `case` statement: `case ... when ... then ... end case`
+    CaseStmt,
+}
+
+/// A PL/pgSQL control block. `indent` is the column of the keyword that opened it,
+/// which is also where its `else`/`elsif`/`exception`/`end` go.
+#[derive(Clone, Copy)]
+struct Block {
+    kind: BlockKind,
+    indent: usize,
+    /// Begin: inside the `exception` section. Loop: still in the `for`/`while` header.
+    flag: bool,
+    /// Byte offset of the line the block opened on (Loop headers only).
+    line_start: usize,
+}
+
+fn line_start(out: &str) -> usize {
+    out.rfind('\n').map(|p| p + 1).unwrap_or(0)
+}
+
 fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error> {
     let scan_res = pg_query::scan(input)?;
     let tokens = scan_res.tokens;
@@ -39,7 +67,14 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
     let mut cte_indent = base_indent;
     let mut in_declare_section = false;
     let mut in_create_function = false;
+    let mut in_create_index = false;
     let mut case_stack: Vec<usize> = Vec::new();
+    let mut block_stack: Vec<Block> = Vec::new();
+    let mut declare_indent = base_indent;
+
+    let tok_kind = |j: usize| Token::try_from(tokens[j].token).unwrap_or(Token::Nul);
+    let tok_raw = |j: usize| &input[tokens[j].start as usize..tokens[j].end as usize];
+    let is_word = |j: usize, w: &str| j < tokens.len() && tok_raw(j).eq_ignore_ascii_case(w);
 
     let push_newline = |out: &mut String, cols: usize| {
         while out.ends_with(' ') {
@@ -71,9 +106,32 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             Token::Nul
         };
 
+        // Start of a PL/pgSQL statement: first token, or right after something that ends
+        // or opens a statement list (comments are skipped).
+        let prev_sig = (0..i)
+            .rev()
+            .find(|&j| !matches!(tok_kind(j), Token::SqlComment | Token::CComment));
+        let at_stmt_start = match prev_sig {
+            None => true,
+            Some(j) => {
+                tok_raw(j) == ";"
+                    || matches!(tok_kind(j), Token::Then | Token::Else | Token::BeginP | Token::Declare)
+                    || is_word(j, "loop")
+                    || is_word(j, "exception")
+            }
+        };
+
         // Track CREATE FUNCTION header, RETURNS <type> boundary, and CTE blocks
         if kind == Token::Create {
             stmt_indent = indent;
+            // Skip `or replace` / `unique` to find what's being created
+            let mut j = i + 1;
+            while j < tokens.len()
+                && matches!(tok_kind(j), Token::Or | Token::Replace | Token::Unique)
+            {
+                j += 1;
+            }
+            in_create_index = j < tokens.len() && tok_kind(j) == Token::Index;
             in_create_function = true;
             in_create_function_header = true;
             in_returns_type = false;
@@ -135,19 +193,35 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         }
 
         // 1. Major SQL clauses & PL/pgSQL block boundaries
+        let top_block = block_stack.last().copied();
+        let ends_block_kind = |k: BlockKind| match k {
+            BlockKind::If => next_kind == Token::IfP,
+            BlockKind::Loop => is_word(i + 1, "loop"),
+            BlockKind::CaseStmt => next_kind == Token::Case,
+            BlockKind::Begin => false,
+        };
+        let is_plain_begin = kind == Token::BeginP
+            && !(i + 1 < tokens.len()
+                && (tok_raw(i + 1) == ";" || matches!(next_kind, Token::Transaction | Token::Work)));
+
         if kind == Token::Declare {
-            push_newline(&mut out, indent);
-            stmt_indent = indent + 2;
+            declare_indent = stmt_indent;
+            push_newline(&mut out, declare_indent);
+            stmt_indent = declare_indent + 2;
             in_declare_section = true;
             next_line_indent = None;
-        } else if kind == Token::BeginP {
-            push_newline(&mut out, indent);
-            stmt_indent = indent + 2;
+        } else if is_plain_begin {
+            let block_indent = if in_declare_section { declare_indent } else { stmt_indent };
+            push_newline(&mut out, block_indent);
+            block_stack.push(Block { kind: BlockKind::Begin, indent: block_indent, flag: false, line_start: 0 });
+            stmt_indent = block_indent + 2;
             in_declare_section = false;
             next_line_indent = None;
         } else if kind == Token::EndP {
-            if next_kind == Token::IfP {
-                stmt_indent = stmt_indent.saturating_sub(2).max(indent + 2);
+            let closes_named = top_block.map(|b| b.kind != BlockKind::Begin && ends_block_kind(b.kind));
+            if closes_named == Some(true) || (case_stack.is_empty() && top_block.map(|b| b.kind) == Some(BlockKind::Begin)) {
+                let b = block_stack.pop().unwrap();
+                stmt_indent = b.indent;
                 push_newline(&mut out, stmt_indent);
             } else if let Some(case_col) = case_stack.pop() {
                 push_newline(&mut out, case_col);
@@ -160,19 +234,42 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             let case_col = *case_stack.last().unwrap();
             push_newline(&mut out, case_col + 2);
             next_line_indent = None;
+        } else if kind == Token::When
+            && !(prev_sig.is_some_and(|j| is_word(j, "exit") || is_word(j, "continue")))
+            && top_block.is_some_and(|b| {
+                b.kind == BlockKind::CaseStmt || (b.kind == BlockKind::Begin && b.flag)
+            })
+        {
+            // `when` arm of a CASE statement or an exception handler
+            push_newline(&mut out, top_block.unwrap().indent + 2);
+            next_line_indent = None;
+        } else if kind == Token::Ident
+            && raw.eq_ignore_ascii_case("exception")
+            && at_stmt_start
+            && top_block.is_some_and(|b| b.kind == BlockKind::Begin)
+        {
+            let b = block_stack.last_mut().unwrap();
+            b.flag = true;
+            stmt_indent = b.indent + 2;
+            push_newline(&mut out, b.indent);
+            next_line_indent = None;
         } else if kind == Token::Ident
             && raw.eq_ignore_ascii_case("elsif")
-            && stmt_indent > indent + 2
+            && top_block.is_some_and(|b| b.kind == BlockKind::If)
         {
-            stmt_indent -= 2;
+            stmt_indent = top_block.unwrap().indent;
             push_newline(&mut out, stmt_indent);
             next_line_indent = None;
         } else if kind == Token::Else {
             if let Some(&case_col) = case_stack.last() {
                 push_newline(&mut out, case_col + 2);
                 next_line_indent = None;
-            } else if stmt_indent > indent + 2 {
-                push_newline(&mut out, stmt_indent - 2);
+            } else if let Some(b) = top_block {
+                match b.kind {
+                    BlockKind::If => push_newline(&mut out, b.indent),
+                    BlockKind::CaseStmt => push_newline(&mut out, b.indent + 2),
+                    _ => {}
+                }
                 next_line_indent = None;
             }
         } else if matches!(
@@ -206,7 +303,12 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         }
 
         // 3. ON -> keep on the same line as JOIN, then indent the ON condition (+4)
-        if kind == Token::On {
+        if kind == Token::On && in_create_index && paren_stack.is_empty() {
+            // create index <name>
+            //   on <table> (<columns>)
+            push_newline(&mut out, stmt_indent + 2);
+            next_line_indent = None;
+        } else if kind == Token::On {
             next_line_indent = Some(stmt_indent + 4);
         } else if raw != "(" {
             if let Some(cols) = next_line_indent.take() {
@@ -214,7 +316,48 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             }
         }
 
-        if kind == Token::Case {
+        // PL/pgSQL block openers (`end if` / `end loop` / `end case` are handled above)
+        let after_end = prev_kind == Token::EndP;
+        let mut is_case_stmt = false;
+        if at_stmt_start && paren_stack.is_empty() && !after_end {
+            let header_loop = kind == Token::For
+                || (kind == Token::Ident
+                    && (raw.eq_ignore_ascii_case("while") || raw.eq_ignore_ascii_case("foreach")));
+            let opener = if kind == Token::IfP {
+                Some((BlockKind::If, false))
+            } else if header_loop {
+                Some((BlockKind::Loop, true))
+            } else if kind == Token::Case {
+                is_case_stmt = true;
+                Some((BlockKind::CaseStmt, false))
+            } else {
+                None
+            };
+            if let Some((bk, flag)) = opener {
+                block_stack.push(Block { kind: bk, indent: stmt_indent, flag, line_start: line_start(&out) });
+            }
+        }
+        if kind == Token::Ident && raw.eq_ignore_ascii_case("loop") && !after_end {
+            match block_stack.last_mut() {
+                Some(b) if b.kind == BlockKind::Loop && b.flag => {
+                    // End of a `for`/`while` header; if it wrapped, put `loop` on its own line
+                    b.flag = false;
+                    if line_start(&out) != b.line_start {
+                        push_newline(&mut out, b.indent);
+                    }
+                    stmt_indent = b.indent + 2;
+                    next_line_indent = Some(stmt_indent);
+                }
+                _ if at_stmt_start => {
+                    block_stack.push(Block { kind: BlockKind::Loop, indent: stmt_indent, flag: false, line_start: 0 });
+                    stmt_indent += 2;
+                    next_line_indent = Some(stmt_indent);
+                }
+                _ => {}
+            }
+        }
+
+        if kind == Token::Case && !after_end && !is_case_stmt {
             let current_line = out.rsplit('\n').next().unwrap_or("");
             let mut case_col = current_line.len();
             if let Some(last) = current_line.chars().last() {
@@ -251,11 +394,21 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             next_line_indent = Some(stmt_indent + 2);
         } else if matches!(kind, Token::Declare | Token::BeginP) {
             next_line_indent = Some(stmt_indent);
-        } else if kind == Token::Then && case_stack.is_empty() {
-            stmt_indent += 2;
-            next_line_indent = Some(stmt_indent);
-        } else if kind == Token::Else && case_stack.is_empty() && stmt_indent > indent + 2 {
-            next_line_indent = Some(stmt_indent);
+        } else if matches!(kind, Token::Then | Token::Else) && case_stack.is_empty() {
+            // Body of an if/elsif/else, CASE statement arm, or exception handler
+            let body = match top_block {
+                Some(b) if b.kind == BlockKind::If => Some(b.indent + 2),
+                Some(b) if b.kind == BlockKind::CaseStmt => Some(b.indent + 4),
+                Some(b) if b.kind == BlockKind::Begin && b.flag && kind == Token::Then => {
+                    Some(b.indent + 4)
+                }
+                None if kind == Token::Then => Some(stmt_indent + 2),
+                _ => None,
+            };
+            if let Some(body) = body {
+                stmt_indent = body;
+                next_line_indent = Some(stmt_indent);
+            }
         } else if kind == Token::Union {
             if next_kind != Token::All {
                 next_line_indent = Some(stmt_indent);
@@ -331,6 +484,11 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                     }
                 } else if had_pending_indent {
                     push_newline(&mut out, stmt_indent + 2);
+                } else if in_create_index && paren_stack.is_empty() {
+                    // `on tbl (col, ...)`, `include (col, ...)`
+                    if out.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                        out.push(' ');
+                    }
                 }
 
                 let current_line = out.rsplit('\n').next().unwrap_or("");
@@ -392,30 +550,40 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                     push_newline(&mut out, cte_indent);
                     out.push_str(", ");
                 } else {
-                    let pkind = paren_stack
-                        .last()
-                        .map(|f| f.kind)
-                        .unwrap_or(ParenKind::CreateFuncParams);
-                    if pkind == ParenKind::InlineCall {
-                        out.push_str(", ");
-                    } else {
-                        push_newline(&mut out, stmt_indent);
-                        out.push_str(", ");
+                    match paren_stack.last() {
+                        Some(f) if f.kind == ParenKind::InlineCall => out.push_str(", "),
+                        // Align with the line that opened the list, e.g. an index's
+                        // `  on tbl (` line rather than the statement's start
+                        Some(f) if f.kind == ParenKind::CreateFuncParams => {
+                            push_newline(&mut out, f.close_indent);
+                            out.push_str(", ");
+                        }
+                        _ => {
+                            push_newline(&mut out, stmt_indent);
+                            out.push_str(", ");
+                        }
                     }
                 }
             }
             ";" => {
                 in_between = false;
                 in_cte_list = false;
+                in_create_index = false;
                 out.push(';');
 
                 let next_closes_block = matches!(next_kind, Token::EndP | Token::Else)
-                    || (next_kind == Token::Ident
-                        && i + 1 < tokens.len()
-                        && input[tokens[i + 1].start as usize..tokens[i + 1].end as usize]
-                            .eq_ignore_ascii_case("elsif"));
+                    || (next_kind == Token::When && case_stack.is_empty())
+                    || is_word(i + 1, "elsif")
+                    || is_word(i + 1, "exception");
 
-                if stmt_indent <= indent + 2 && !next_closes_block && !in_declare_section {
+                // Blank line between statements only at the top level / directly in the outermost `begin`
+                let top_level = match block_stack.as_slice() {
+                    [] => true,
+                    [b] => b.kind == BlockKind::Begin && !b.flag,
+                    _ => false,
+                };
+
+                if top_level && !next_closes_block && !in_declare_section {
                     out.push_str("\n\n");
                     out.push_str(&" ".repeat(stmt_indent));
                 } else {
@@ -485,6 +653,31 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
     Ok(out.trim_end().to_string() + "\n")
 }
 
+/// Whether `input` is valid as PL/pgSQL statements (e.g. a selection from inside a
+/// function body) rather than a complete SQL statement. It's checked by wrapping it in
+/// a function. `return x` / `return;` / `return next` are only valid for some return
+/// types, so a few are tried.
+fn is_plpgsql_fragment(input: &str) -> bool {
+    let tag = (0..)
+        .map(|n| format!("$sqlfmt{n}$"))
+        .find(|t| !input.contains(t.as_str()))
+        .unwrap();
+    // A fragment may bring its own `declare ... begin ... end`; otherwise wrap in one.
+    let body = if pg_query::scan(input).ok().and_then(|s| s.tokens.first().map(|t| t.token))
+        == Some(Token::Declare as i32)
+    {
+        input.to_string()
+    } else {
+        format!("begin\n{input}\nend")
+    };
+    ["int", "void", "setof record"].iter().any(|ret| {
+        let wrapped = format!(
+            "create function pg_temp.sqlfmt_check() returns {ret} language plpgsql as {tag}\n{body}\n{tag};"
+        );
+        pg_query::parse_plpgsql(&wrapped).is_ok()
+    })
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let in_place = args.iter().any(|a| a == "-i" || a == "--in-place");
@@ -500,11 +693,21 @@ fn main() {
     };
 
     if let Err(e) = pg_query::parse(&input) {
-        eprintln!("PostgreSQL syntax error: {e}");
-        std::process::exit(1);
+        if !is_plpgsql_fragment(&input) {
+            eprintln!("PostgreSQL syntax error: {e}");
+            std::process::exit(1);
+        }
     }
 
-    let formatted = format_sql(&input, 0).expect("Failed to format SQL");
+    // Keep the first line's indentation, so a selection from inside a function body
+    // stays where it was.
+    let base_indent = input
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start_matches(' ').len())
+        .unwrap_or(0);
+
+    let formatted = format_sql(&input, base_indent).expect("Failed to format SQL");
 
     if in_place {
         let path = file_arg.expect("-i requires a file path");

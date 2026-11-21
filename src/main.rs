@@ -68,6 +68,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
     let mut in_declare_section = false;
     let mut in_create_function = false;
     let mut in_create_index = false;
+    let mut storage_params_next = false;
     let mut case_stack: Vec<usize> = Vec::new();
     let mut block_stack: Vec<Block> = Vec::new();
     let mut declare_indent = base_indent;
@@ -165,7 +166,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             in_create_function_header = false;
             in_returns_type = false;
             push_newline(&mut out, indent);
-        } else if kind == Token::As {
+        } else if kind == Token::As && paren_stack.is_empty() {
             in_create_function_header = false;
         }
 
@@ -308,6 +309,8 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             //   on <table> (<columns>)
             push_newline(&mut out, stmt_indent + 2);
             next_line_indent = None;
+        } else if kind == Token::On && matches!(next_kind, Token::DeleteP | Token::Update) {
+            // `references t(id) on delete set null` stays on one line
         } else if kind == Token::On {
             next_line_indent = Some(stmt_indent + 4);
         } else if raw != "(" {
@@ -369,7 +372,19 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         }
 
         // Capture the exact indentation where `WITH` was placed
-        if kind == Token::With && paren_stack.is_empty() {
+        let is_storage_params = kind == Token::With
+            && paren_stack.is_empty()
+            && i + 1 < tokens.len()
+            && tok_raw(i + 1) == "(";
+        if is_storage_params {
+            // create table ... (...)
+            // with(
+            //   param = value
+            // , ...
+            // );
+            push_newline(&mut out, stmt_indent);
+            storage_params_next = true;
+        } else if kind == Token::With && paren_stack.is_empty() {
             in_cte_list = true;
             let current_line = out.rsplit('\n').next().unwrap_or("");
             cte_indent = current_line.chars().take_while(|c| *c == ' ').count();
@@ -462,7 +477,9 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                     }
                 }
 
-                let pkind = if in_create_function_header && paren_stack.is_empty() {
+                let pkind = if (in_create_function_header || prev_kind == Token::With && std::mem::take(&mut storage_params_next))
+                    && paren_stack.is_empty()
+                {
                     ParenKind::CreateFuncParams
                 } else if is_subquery {
                     ParenKind::Subquery
@@ -484,8 +501,8 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                     }
                 } else if had_pending_indent {
                     push_newline(&mut out, stmt_indent + 2);
-                } else if in_create_index && paren_stack.is_empty() {
-                    // `on tbl (col, ...)`, `include (col, ...)`
+                } else if (in_create_index || prev_kind == Token::With) && paren_stack.is_empty() {
+                    // `on tbl (col, ...)`, `include (col, ...)`, `with (param = ...)`
                     if out.chars().last().is_some_and(|c| !c.is_whitespace()) {
                         out.push(' ');
                     }
@@ -569,6 +586,12 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 in_between = false;
                 in_cte_list = false;
                 in_create_index = false;
+                if paren_stack.is_empty() {
+                    // Don't leak `create ...` state into the next statement
+                    in_create_function = false;
+                    in_create_function_header = false;
+                    in_returns_type = false;
+                }
                 out.push(';');
 
                 let next_closes_block = matches!(next_kind, Token::EndP | Token::Else)

@@ -8,6 +8,7 @@ enum ParenKind {
     CreateFuncParams,
     BooleanGroup,
     Subquery,
+    WindowSpec,
     InlineCall,
 }
 
@@ -263,8 +264,29 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             next_line_indent = Some(stmt_indent);
         }
 
+        let in_window_spec = paren_stack
+            .last()
+            .map(|f| f.kind == ParenKind::WindowSpec)
+            .unwrap_or(false);
+
+        if in_window_spec {
+            let win_frame = *paren_stack.last().unwrap();
+            let win_clause_indent = win_frame.close_indent + 2;
+
+            if matches!(kind, Token::Partition | Token::Order) {
+                push_newline(&mut out, win_clause_indent);
+                next_line_indent = None;
+            } else if kind == Token::By && matches!(prev_kind, Token::Partition | Token::Order) {
+                next_line_indent = Some(win_clause_indent + 2);
+            } else if matches!(kind, Token::Rows | Token::Range | Token::Groups) {
+                push_newline(&mut out, win_clause_indent);
+                next_line_indent = Some(win_clause_indent + 2);
+            }
+        }
+
         match raw {
             "(" => {
+                let is_window_spec = prev_kind == Token::Over;
                 let had_pending_indent = next_line_indent.take().is_some();
                 let is_subquery = matches!(next_kind, Token::Select | Token::With);
 
@@ -291,6 +313,8 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                     ParenKind::CreateFuncParams
                 } else if is_subquery {
                     ParenKind::Subquery
+                } else if is_window_spec {
+                    ParenKind::WindowSpec
                 } else if has_bool_op {
                     ParenKind::BooleanGroup
                 } else {

@@ -201,6 +201,37 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             BlockKind::CaseStmt => next_kind == Token::Case,
             BlockKind::Begin => false,
         };
+        // `select ... into x, y` / `returning ... into x` gets its own clause, unlike
+        // `insert into` / `fetch c into` / `execute '...' into`.
+        let is_clause_into = kind == Token::Into && {
+            let mut depth = 0i32;
+            let mut found = false;
+            for j in (0..i).rev() {
+                let r = tok_raw(j);
+                if r == ")" {
+                    depth += 1;
+                } else if r == "(" {
+                    depth -= 1;
+                    if depth < 0 {
+                        break;
+                    }
+                } else if depth == 0 {
+                    let k = tok_kind(j);
+                    if r == ";"
+                        || matches!(k, Token::Then | Token::Else | Token::BeginP | Token::Declare)
+                        || is_word(j, "loop")
+                        || is_word(j, "exception")
+                    {
+                        break;
+                    }
+                    if matches!(k, Token::Select | Token::Returning) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            found
+        };
         let is_plain_begin = kind == Token::BeginP
             && !(i + 1 < tokens.len()
                 && (tok_raw(i + 1) == ";" || matches!(next_kind, Token::Transaction | Token::Work)));
@@ -273,7 +304,8 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 }
                 next_line_indent = None;
             }
-        } else if matches!(
+        } else if is_clause_into
+            || matches!(
             kind,
             Token::From
                 | Token::Where
@@ -403,7 +435,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             if !in_inline_call {
                 next_line_indent = Some(stmt_indent + 2);
             }
-        } else if matches!(kind, Token::From | Token::Where) {
+        } else if is_clause_into || matches!(kind, Token::From | Token::Where) {
             next_line_indent = Some(stmt_indent + 2);
         } else if kind == Token::By && matches!(prev_kind, Token::Order | Token::GroupP) {
             next_line_indent = Some(stmt_indent + 2);

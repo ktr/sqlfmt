@@ -712,24 +712,81 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
 /// function body) rather than a complete SQL statement. It's checked by wrapping it in
 /// a function. `return x` / `return;` / `return next` are only valid for some return
 /// types, so a few are tried.
+///
+/// PL/pgSQL checks `into` targets when parsing, so a selection that doesn't include its
+/// `declare` section is also tried with those targets declared. The wrapper is only used
+/// for this check; it never reaches the formatted output.
 fn is_plpgsql_fragment(input: &str) -> bool {
     let tag = (0..)
         .map(|n| format!("$sqlfmt{n}$"))
         .find(|t| !input.contains(t.as_str()))
         .unwrap();
-    // A fragment may bring its own `declare ... begin ... end`; otherwise wrap in one.
-    let body = if pg_query::scan(input).ok().and_then(|s| s.tokens.first().map(|t| t.token))
-        == Some(Token::Declare as i32)
-    {
-        input.to_string()
-    } else {
-        format!("begin\n{input}\nend")
+    let Ok(scan) = pg_query::scan(input) else {
+        return false;
     };
-    ["int", "void", "setof record"].iter().any(|ret| {
-        let wrapped = format!(
-            "create function pg_temp.sqlfmt_check() returns {ret} language plpgsql as {tag}\n{body}\n{tag};"
-        );
-        pg_query::parse_plpgsql(&wrapped).is_ok()
+    let tokens = scan.tokens;
+    let kind = |j: usize| Token::try_from(tokens[j].token).unwrap_or(Token::Nul);
+    let raw = |j: usize| &input[tokens[j].start as usize..tokens[j].end as usize];
+    let starts_with_declare = tokens.first().map(|t| t.token) == Some(Token::Declare as i32);
+
+    // (name, used with a field)
+    let mut targets: Vec<(&str, bool)> = Vec::new();
+    for i in 0..tokens.len() {
+        if kind(i) != Token::Into || (i > 0 && matches!(kind(i - 1), Token::Insert | Token::Merge)) {
+            continue;
+        }
+        let mut j = i + 1;
+        if j < tokens.len() && kind(j) == Token::StrictP {
+            j += 1;
+        }
+        // `into a, b` / `into rec.field`: declare `a` and `b` as scalars, `rec` as a record
+        // (a record can't be one of several targets, and a scalar can't have fields).
+        while j < tokens.len() && kind(j) == Token::Ident {
+            let dotted = j + 1 < tokens.len() && raw(j + 1) == ".";
+            match targets.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(raw(j))) {
+                Some(t) => t.1 |= dotted,
+                None => targets.push((raw(j), dotted)),
+            }
+            j += 1;
+            while j + 1 < tokens.len() && raw(j) == "." {
+                j += 2;
+            }
+            if j < tokens.len() && raw(j) == "," {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let decls: String = targets
+        .iter()
+        .map(|(name, dotted)| format!("{name} {};\n", if *dotted { "record" } else { "text" }))
+        .collect();
+
+    let mut bodies = Vec::new();
+    // A fragment may bring its own `declare ... begin ... end`; otherwise wrap in one.
+    if starts_with_declare {
+        bodies.push(input.to_string());
+        if !decls.is_empty() {
+            // Declared in an outer block so the fragment's own declarations can shadow them
+            let block = input.trim_end().trim_end_matches(';');
+            bodies.push(format!("declare\n{decls}begin\n{block};\nend"));
+        }
+    } else {
+        bodies.push(format!("begin\n{input}\nend"));
+        if !decls.is_empty() {
+            bodies.push(format!("declare\n{decls}begin\n{input}\nend"));
+        }
+    }
+
+    bodies.iter().any(|body| {
+        ["int", "void", "setof record"].iter().any(|ret| {
+            let wrapped = format!(
+                "create function pg_temp.sqlfmt_check() returns {ret} language plpgsql as {tag}\n{body}\n{tag};"
+            );
+            pg_query::parse_plpgsql(&wrapped).is_ok()
+        })
     })
 }
 

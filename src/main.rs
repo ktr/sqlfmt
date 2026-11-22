@@ -105,31 +105,43 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         out.push_str(&" ".repeat(cols));
     };
 
+    let is_comment = |j: usize| matches!(tok_kind(j), Token::SqlComment | Token::CComment);
+    // Comments go on their own line(s) just above the line holding the next token. They're
+    // collected here and placed once that token has been written (`place_comments_at`).
+    let mut pending_comments: Vec<&str> = Vec::new();
+    let mut place_comments_at: Option<usize> = None;
+
     for i in 0..tokens.len() {
+        if let Some(pos) = place_comments_at.take() {
+            let (at, added) = insert_comments(&mut out, pos, &pending_comments);
+            for b in block_stack.iter_mut() {
+                if b.line_start >= at {
+                    b.line_start += added;
+                }
+            }
+            pending_comments.clear();
+        }
+
         let tok = &tokens[i];
         let raw = &input[tok.start as usize..tok.end as usize];
         let kind = Token::try_from(tok.token).unwrap_or(Token::Nul);
-        let prev_kind = if i > 0 {
-            Token::try_from(tokens[i - 1].token).unwrap_or(Token::Nul)
-        } else {
-            Token::Nul
-        };
-        let prev_raw = if i > 0 {
-            &input[tokens[i - 1].start as usize..tokens[i - 1].end as usize]
-        } else {
-            ""
-        };
-        let next_kind = if i + 1 < tokens.len() {
-            Token::try_from(tokens[i + 1].token).unwrap_or(Token::Nul)
-        } else {
-            Token::Nul
-        };
+        if is_comment(i) {
+            pending_comments.push(raw.trim_end());
+            continue;
+        }
+        if !pending_comments.is_empty() {
+            place_comments_at = Some(out.trim_end().len());
+        }
+
+        // Neighbouring tokens, skipping comments
+        let prev_sig = (0..i).rev().find(|&j| !is_comment(j));
+        let next_sig = (i + 1..tokens.len()).find(|&j| !is_comment(j));
+        let prev_kind = prev_sig.map_or(Token::Nul, |j| tok_kind(j));
+        let prev_raw = prev_sig.map_or("", |j| tok_raw(j));
+        let next_kind = next_sig.map_or(Token::Nul, |j| tok_kind(j));
 
         // Start of a PL/pgSQL statement: first token, or right after something that ends
-        // or opens a statement list (comments are skipped).
-        let prev_sig = (0..i)
-            .rev()
-            .find(|&j| !matches!(tok_kind(j), Token::SqlComment | Token::CComment));
+        // or opens a statement list.
         let at_stmt_start = match prev_sig {
             None => true,
             Some(j) => {
@@ -681,13 +693,6 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 }
             }
             _ => match kind {
-                Token::SqlComment | Token::CComment => {
-                    if out.chars().last().is_some_and(|c| !c.is_whitespace()) {
-                        out.push(' ');
-                    }
-                    out.push_str(raw);
-                    push_newline(&mut out, stmt_indent);
-                }
                 Token::Sconst => {
                     if let Some(last) = out.chars().last() {
                         if !last.is_whitespace() && last != '(' && last != '[' {
@@ -744,7 +749,45 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         }
     }
 
+    if let Some(pos) = place_comments_at {
+        insert_comments(&mut out, pos, &pending_comments);
+    } else if !pending_comments.is_empty() {
+        // Comments after the last token
+        if !line_is_blank(&out) {
+            push_newline(&mut out, stmt_indent);
+        }
+        let pad = " ".repeat(stmt_indent);
+        out.truncate(line_start(&out));
+        for c in &pending_comments {
+            out.push_str(&pad);
+            out.push_str(c);
+            out.push('\n');
+        }
+    }
+
     Ok(out.trim_end().to_string() + "\n")
+}
+
+fn line_is_blank(out: &str) -> bool {
+    out[line_start(out)..].trim().is_empty()
+}
+
+/// Puts `comments` on their own lines just above the line holding the first token written
+/// at or after `pos`, indented to match that line's content (past a leading `, `).
+/// Returns where the text was inserted and its length.
+fn insert_comments(out: &mut String, pos: usize, comments: &[&str]) -> (usize, usize) {
+    let pos = pos.min(out.len());
+    let tok_at = out[pos..]
+        .find(|c: char| !c.is_whitespace())
+        .map_or(out.len(), |k| pos + k);
+    let ls = line_start(&out[..tok_at]);
+    let line = &out[ls..];
+    let lead = line.len() - line.trim_start_matches(' ').len();
+    let indent = lead + if line[lead..].starts_with(", ") { 2 } else { 0 };
+    let pad = " ".repeat(indent);
+    let text: String = comments.iter().map(|c| format!("{pad}{c}\n")).collect();
+    out.insert_str(ls, &text);
+    (ls, text.len())
 }
 
 /// Whether `input` is valid as PL/pgSQL statements (e.g. a selection from inside a

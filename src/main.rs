@@ -232,6 +232,14 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             }
             found
         };
+        // Row-locking clause: `for update` / `for no key update` / `for share` / `for key share`.
+        // (`at_stmt_start` rules out a PL/pgSQL `for` loop with a variable named e.g. `no`.)
+        let is_locking_clause = kind == Token::For
+            && !at_stmt_start
+            && (is_word(i + 1, "update")
+                || is_word(i + 1, "share")
+                || (is_word(i + 1, "no") && is_word(i + 2, "key"))
+                || (is_word(i + 1, "key") && is_word(i + 2, "share")));
         let is_plain_begin = kind == Token::BeginP
             && !(i + 1 < tokens.len()
                 && (tok_raw(i + 1) == ";" || matches!(next_kind, Token::Transaction | Token::Work)));
@@ -305,6 +313,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 next_line_indent = None;
             }
         } else if is_clause_into
+            || is_locking_clause
             || matches!(
             kind,
             Token::From

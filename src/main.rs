@@ -682,6 +682,9 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
             }
             _ => match kind {
                 Token::SqlComment | Token::CComment => {
+                    if out.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                        out.push(' ');
+                    }
                     out.push_str(raw);
                     push_newline(&mut out, stmt_indent);
                 }
@@ -722,10 +725,11 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 _ => {
                     let lower = raw.to_lowercase();
                     let no_space_before =
-                        lower == "." || lower == "%" || kind == Token::Typecast;
+                        lower == "." || lower == ".." || lower == "%" || kind == Token::Typecast;
                     let after_tight_token = prev_raw == "("
                         || prev_raw == "["
                         || prev_raw == "."
+                        || prev_raw == ".."
                         || prev_raw == "%"
                         || prev_kind == Token::Typecast;
 

@@ -41,6 +41,24 @@ struct Block {
     flag: bool,
     /// Byte offset of the line the block opened on (Loop headers only).
     line_start: usize,
+    /// Index of the token that opened the block.
+    first_tok: usize,
+}
+
+/// Joins a wrapped `for`/`while` loop header (everything in `out` from `start`) back onto
+/// one line: each line break, with the indentation after it, becomes a single space, or
+/// nothing just inside parentheses.
+fn join_header_lines(out: &mut String, start: usize) {
+    let header = out.split_off(start);
+    let mut lines = header.split('\n');
+    out.push_str(lines.next().unwrap_or(""));
+    for line in lines {
+        let line = line.trim_start();
+        if !(out.ends_with('(') || line.starts_with(')') || line.is_empty()) {
+            out.push(' ');
+        }
+        out.push_str(line);
+    }
 }
 
 fn line_start(out: &str) -> usize {
@@ -253,7 +271,7 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
         } else if is_plain_begin {
             let block_indent = if in_declare_section { declare_indent } else { stmt_indent };
             push_newline(&mut out, block_indent);
-            block_stack.push(Block { kind: BlockKind::Begin, indent: block_indent, flag: false, line_start: 0 });
+            block_stack.push(Block { kind: BlockKind::Begin, indent: block_indent, flag: false, line_start: 0, first_tok: i });
             stmt_indent = block_indent + 2;
             in_declare_section = false;
             next_line_indent = None;
@@ -378,22 +396,30 @@ fn format_sql(input: &str, base_indent: usize) -> Result<String, pg_query::Error
                 None
             };
             if let Some((bk, flag)) = opener {
-                block_stack.push(Block { kind: bk, indent: stmt_indent, flag, line_start: line_start(&out) });
+                block_stack.push(Block { kind: bk, indent: stmt_indent, flag, line_start: line_start(&out), first_tok: i });
             }
         }
         if kind == Token::Ident && raw.eq_ignore_ascii_case("loop") && !after_end {
             match block_stack.last_mut() {
                 Some(b) if b.kind == BlockKind::Loop && b.flag => {
-                    // End of a `for`/`while` header; if it wrapped, put `loop` on its own line
+                    // End of a `for`/`while` header: keep it on one line with `loop`. If it
+                    // has a comment or a multi-line string literal, joining it would change
+                    // its meaning, so leave it wrapped and put `loop` on its own line.
                     b.flag = false;
-                    if line_start(&out) != b.line_start {
+                    let keep_wrapped = (b.first_tok..i).any(|j| {
+                        matches!(tok_kind(j), Token::SqlComment | Token::CComment)
+                            || tok_raw(j).contains('\n')
+                    });
+                    if !keep_wrapped {
+                        join_header_lines(&mut out, b.line_start);
+                    } else if line_start(&out) != b.line_start {
                         push_newline(&mut out, b.indent);
                     }
                     stmt_indent = b.indent + 2;
                     next_line_indent = Some(stmt_indent);
                 }
                 _ if at_stmt_start => {
-                    block_stack.push(Block { kind: BlockKind::Loop, indent: stmt_indent, flag: false, line_start: 0 });
+                    block_stack.push(Block { kind: BlockKind::Loop, indent: stmt_indent, flag: false, line_start: 0, first_tok: i });
                     stmt_indent += 2;
                     next_line_indent = Some(stmt_indent);
                 }
